@@ -1,0 +1,11 @@
+python-docx>=1.1.0
+python-pptx>=0.6.23
+openpyxl>=3.1.0
+pypdf>=4.0.0
+Pillow>=10.0.0
+
+# ---- 可选增强（不装也不影响基本功能）----
+# 本地中文关键词更准（仅本地模式受益）：
+# jieba>=0.42.1
+# 图片 OCR（还需另外安装 Tesseract 本体和中文语言包）：
+# pytesseract>=0.3.10

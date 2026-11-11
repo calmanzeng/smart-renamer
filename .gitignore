@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# 测试临时目录（脚本运行后自清理，防止误提交）
+_browser_e2e/
+_diag_tmp/
+_webtest/
+_e2e_tmp/
+
+# 系统文件
+Thumbs.db
+.DS_Store
