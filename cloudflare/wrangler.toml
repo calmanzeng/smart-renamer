@@ -4,3 +4,9 @@ compatibility_date = "2025-05-01"
 
 [vars]
 CF_ACCOUNT_ID = "cfedcec6ff705cd4535211c202392996"
+
+# 自定义域名说明：
+# Custom Domains API 仅支持 OAuth（API Token 会报 10405），
+# 因此用「DNS CNAME -> workers.dev + Worker Route」方式绑定，在 Cloudflare 控制台配置：
+#   DNS: smart-renamer.life-dao.com  CNAME workers.dev（已代理）
+#   Workers Routes: smart-renamer.life-dao.com/* -> script smart-renamer

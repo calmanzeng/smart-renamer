@@ -54,16 +54,21 @@
 
 除了本地版，项目还带一个**部署在 Cloudflare Workers 上的网页版**，任何设备打开网址即可用：
 
-- **地址**：https://smart-renamer.calman198705.workers.dev
+- **主地址**：https://smart-renamer.life-dao.com
+- **备用地址**：https://smart-renamer.calman198705.workers.dev
 - **流程**：浏览器拖入文件 → 云端抽取内容并用 Cloudflare 自带 LLM（llama-3.3-70b）总结主题 → 给出建议名 → 本地下载改名后的文件（正文不落云端）
 
 ```
 cloudflare/
 ├── worker.js         零依赖 Worker（手写 ZIP/EXIF 解析 + 类型/关键词/日期 + Workers AI 总结）
-├── wrangler.toml     wrangler 配置（名称、兼容日期、CF_ACCOUNT_ID）
+├── wrangler.toml     wrangler 配置（名称、兼容日期、CF_ACCOUNT_ID、域名说明）
 ├── test_worker.mjs   本地 Node 测试（模拟 FormData 上传样本）
 └── verify_online2.mjs 线上端到端验证（真实 Chrome 上传 → AI 分析 → 建议名 → 下载按钮）
 ```
+
+**自定义域名绑定方式**（Cloudflare Custom Domains API 仅支持 OAuth，API Token 会报 10405，故用旧式 Route）：
+- DNS：`smart-renamer.life-dao.com` CNAME `workers.dev`（开启代理）
+- Worker Routes：`smart-renamer.life-dao.com/*` → script `smart-renamer`
 
 **部署/更新**（需要本机有代理时先 `git config --global http.proxy` 或设 HTTPS_PROXY）：
 
@@ -73,9 +78,9 @@ npx wrangler deploy                            # 上传代码
 echo <API_TOKEN> | npx wrangler secret put CF_API_TOKEN   # 配置 AI 调用凭证
 ```
 
-> 说明：workers.dev 账户子域分配后**不能通过 API 修改**（Cloudflare 限制）；若想要
-> `smart-renamer.workers.dev` 这样的纯净域名，需在 Cloudflare 绑定自有的自定义域名，
-> 或联系 Cloudflare 支持调整子域。
+> 说明：workers.dev 账户子域分配后**不能通过 API 修改**（Cloudflare 限制）；本次通过
+> 自有域名 life-dao.com 以 Route 方式绑定了 `smart-renamer.life-dao.com`，NS 需指向
+> Cloudflare（eve.ns.cloudflare.com / kareem.ns.cloudflare.com）。
 
 ## 六、文件说明
 
