@@ -435,6 +435,231 @@ async function aiSummarize(env, info, buf) {
 }
 
 // ---------------------------------------------------------------------------
+// PDF 文本提取（零依赖：对象扫描 + Flate 解压 + Tj/TJ + ToUnicode CMap）
+// ---------------------------------------------------------------------------
+
+// 字节直通转字符串。注意：TextDecoder("latin1") 实际是 windows-1252，
+// 会改写 0x80-0x9F 区间的字节（如 0x9c），破坏二进制流，绝不能用于 PDF。
+function bufToLatin1(input) {
+  const u8 = input instanceof Uint8Array ? input : new Uint8Array(input);
+  const CH = 16384;
+  let s = "";
+  for (let i = 0; i < u8.length; i += CH) {
+    const end = Math.min(i + CH, u8.length);
+    const tmp = new Array(end - i);
+    for (let j = i; j < end; j++) tmp[j - i] = String.fromCharCode(u8[j]);
+    s += tmp.join("");
+  }
+  return s;
+}
+
+function parsePdfObjects(str, limit = 1500) {
+  const objs = new Map();
+  const re = /(\d+)\s+\d+\s+obj\s*([\s\S]*?)(?:stream\r?\n([\s\S]*?)endstream|endobj)/g;
+  let m;
+  while ((m = re.exec(str)) && objs.size < limit) {
+    const id = m[1];
+    let dict = m[2];
+    let stream = null;
+    if (m[3] !== undefined) {
+      stream = m[3].replace(/[\r\n]+$/, "");
+      dict = dict.replace(/stream\s*$/i, "");
+    }
+    objs.set(id, { dict, stream });
+  }
+  return objs;
+}
+
+function pdfUnescape(s) {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "\\" && i + 1 < s.length) {
+      const n = s[i + 1];
+      if (n === "(" || n === ")" || n === "\\") out += n;
+      else if (n === "n") out += "\n";
+      else if (n === "r") out += "\r";
+      else if (n === "t") out += "\t";
+      else if (n >= "0" && n <= "7") {
+        let oct = n, k = 1;
+        while (k < 3 && i + 1 + k < s.length && s[i + 1 + k] >= "0" && s[i + 1 + k] <= "7") { oct += s[i + 1 + k]; k++; }
+        out += String.fromCharCode(parseInt(oct, 8));
+        i += k - 1;
+      } else out += n;
+      i++;
+    } else out += c;
+  }
+  return out;
+}
+
+function hexToText(h) {
+  const bytes = [];
+  for (let i = 0; i + 1 < h.length; i += 2) bytes.push(parseInt(h.slice(i, i + 2), 16));
+  let out = "", i = 0;
+  while (i + 1 < bytes.length) {
+    const v = (bytes[i] << 8) | bytes[i + 1];
+    if (v >= 0xd800 && v <= 0xdbff && i + 3 < bytes.length) {
+      const v2 = (bytes[i + 2] << 8) | bytes[i + 3];
+      out += String.fromCodePoint(0x10000 + ((v - 0xd800) << 10) + (v2 - 0xdc00));
+      i += 4;
+    } else { out += String.fromCodePoint(v); i += 2; }
+  }
+  return out;
+}
+
+function parseCmap(txt) {
+  const map = new Map();
+  let re = /beginbfchar([\s\S]*?)endbfchar/g, m;
+  while ((m = re.exec(txt))) {
+    const pr = /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g;
+    let p;
+    while ((p = pr.exec(m[1]))) map.set(parseInt(p[1], 16), hexToText(p[2]));
+  }
+  re = /beginbfrange([\s\S]*?)endbfrange/g;
+  while ((m = re.exec(txt))) {
+    // <lo> <hi> [<d0> <d1> ...]
+    const ar = /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\[([\s\S]*?)\]/g;
+    let a;
+    while ((a = ar.exec(m[1]))) {
+      const lo = parseInt(a[1], 16), hi = parseInt(a[2], 16);
+      const list = [...a[3].matchAll(/<([0-9A-Fa-f]+)>/g)].map(x => hexToText(x[1]));
+      for (let c = lo, i = 0; c <= hi && i < list.length; c++, i++) map.set(c, list[i]);
+    }
+    // <lo> <hi> <dst>
+    const dr = /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g;
+    let d;
+    while ((d = dr.exec(m[1]))) {
+      const lo = parseInt(d[1], 16), hi = parseInt(d[2], 16);
+      let code = parseInt(d[3], 16);
+      for (let c = lo; c <= hi; c++) { map.set(c, String.fromCodePoint(code)); code++; }
+    }
+  }
+  return map;
+}
+
+async function inflateZlib(buf) {
+  if (buf.length < 2 || (buf[0] & 0x0f) !== 8) return buf.buffer;
+  for (const fmt of ["deflate", "deflate-raw"]) {
+    try {
+      const ds = new DecompressionStream(fmt);
+      const ab = await new Response(new Blob([buf]).stream().pipeThrough(ds)).arrayBuffer();
+      if (ab.byteLength) return ab;
+    } catch (e) { /* next */ }
+  }
+  return buf.buffer;
+}
+
+function bytesToText(bytes, cmap) {
+  if (cmap && cmap.size) {
+    let out = "";
+    // 优先 2 字节 CID 码
+    for (let i = 0; i + 1 < bytes.length; i += 2) {
+      const c = (bytes[i] << 8) | bytes[i + 1];
+      const u = cmap.get(c);
+      out += u !== undefined ? u : "";
+    }
+    if (/[\u4e00-\u9fff]/.test(out) || /[A-Za-z0-9]/.test(out)) return out;
+    out = "";
+    for (const b of bytes) { const u = cmap.get(b); out += u !== undefined ? u : ""; }
+    if (out) return out;
+  }
+  return bytes.map(b => String.fromCharCode(b)).join("");
+}
+
+function pdfContentText(ctxt, cmap) {
+  if (!cmap || !cmap.size) return "";
+  let out = "";
+  const btRe = /BT([\s\S]*?)ET/g;
+  let m;
+  while ((m = btRe.exec(ctxt))) {
+    const block = m[1];
+    const sRe = /\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]+>(?=\s*(?:Tj|TJ|'|"))/g;
+    let s;
+    while ((s = sRe.exec(block))) {
+      if (s[0].startsWith("<")) {
+        const bytes = [];
+        const hx = s[0].replace(/[<>\s]/g, "");
+        for (let i = 0; i + 1 < hx.length; i += 2) bytes.push(parseInt(hx.slice(i, i + 2), 16));
+        out += bytesToText(bytes, cmap);
+      } else {
+        const bytes = [...pdfUnescape(s[0].slice(1, -1))].map(ch => ch.charCodeAt(0) & 0xff);
+        out += bytesToText(bytes, cmap);
+      }
+    }
+    out += "\n";
+  }
+  return out;
+}
+
+async function extractPdfText(buf) {
+  const str = bufToLatin1(new Uint8Array(buf));
+  if (!str.includes("/Type") || !str.includes("endobj")) return "";
+  const objs = parsePdfObjects(str);
+  if (!objs.size) return "";
+  // 页面：/Type /Page 且含 /Contents
+  const pages = [];
+  for (const [id, o] of objs) {
+    if (/\/Type\s*\/Page[\s\/]/.test(o.dict) && !/\/Type\s*\/Pages[\s\/]/.test(o.dict)) {
+      const contents = [];
+      let cm = o.dict.match(/\/Contents\s+(\d+)\s+\d+\s+R/);
+      if (cm) contents.push(cm[1]);
+      cm = o.dict.match(/\/Contents\s*\[([\d\sR]+)\]/);
+      if (cm) contents.push(...cm[1].match(/^\d+/g) || cm[1].match(/\d+/g) || []);
+      if (contents.length) pages.push({ dict: o.dict, contents });
+    }
+  }
+  if (!pages.length) {
+    // 页结构没找到：直接把所有带 /Font 说明的流当内容流（兜底）
+    for (const [, o] of objs) {
+      if (o.stream && /\/ToUnicode/.test(o.dict)) pages.push({ dict: o.dict, contents: [null], custom: o });
+    }
+  }
+  let outAll = "";
+  for (const pg of pages.slice(0, 10)) {
+    const cmap = new Map();
+    const fontRe = /\/F\d+\s+(\d+)\s+\d+\s+R/g;
+    let fm;
+    while ((fm = fontRe.exec(pg.dict))) {
+      const fobj = objs.get(fm[1]);
+      if (!fobj) continue;
+      const tou = fobj.dict.match(/\/ToUnicode\s+(\d+)\s+\d+\s+R/);
+      if (tou) {
+        const cobj = objs.get(tou[1]);
+        if (cobj && cobj.stream) {
+          try {
+            const raw = await inflateZlib(stringToBytes(cobj.stream));
+            const parsed = parseCmap(bufToLatin1(raw));
+            for (const [k, v] of parsed) cmap.set(k, v);
+          } catch (e) { /* ignore font */ }
+        }
+      }
+    }
+    if (!cmap.size) continue;
+    const streams = pg.custom ? [pg.custom.stream] : [];
+    if (!streams.length) {
+      for (const cid of pg.contents) {
+        const co = objs.get(cid);
+        if (co && co.stream) streams.push(co.stream);
+      }
+    }
+    for (const st of streams) {
+      try {
+        const dec = await inflateZlib(stringToBytes(st));
+        outAll += pdfContentText(bufToLatin1(dec), cmap) + "\n";
+      } catch (e) { /* skip */ }
+    }
+    if (outAll.length > 8000) break;
+  }
+  return outAll.trim().slice(0, 8000);
+}
+
+function stringToBytes(s) {
+  const u8 = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i) & 0xff;
+  return u8;
+}
+
+// ---------------------------------------------------------------------------
 // 主流程
 // ---------------------------------------------------------------------------
 
@@ -470,7 +695,7 @@ export default {
   },
 };
 
-export { HTML };
+export { HTML, extractPdfText, analyzeOne };
 
 async function analyzeOne(env, file) {
   const dot = file.name.lastIndexOf(".");
@@ -498,7 +723,10 @@ async function analyzeOne(env, file) {
       info.text = "";
       info.note = imgNote(info.imgBuf);
     } else if (ext === "pdf") {
-      info.note = "PDF 云端暂不解析正文，按日期+类型命名";
+      try { info.text = await extractPdfText(buf); } catch (e) { info.text = ""; }
+      if (!info.text || info.text.length < 4) {
+        info.note = "PDF 未提取到文字（可能是扫描件或加密），按日期+类型命名";
+      }
     }
   } catch (e) {
     info.note = "读取失败: " + e.message;
