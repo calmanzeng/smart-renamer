@@ -356,13 +356,22 @@ function extractImgMeta(buf, ext) {
 }
 
 function bufToDataUrl(buf, mime) {
-  const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+  // 分块转 base64：不用展开运算符（大图会栈溢出）；块长必须是 3 的倍数，
+  // 否则每块产生填充符 '='，拼接出的 base64 损坏（模型解码报 400）。
+  const u8 = new Uint8Array(buf);
+  const CH = 0x6000;   // 24576 = 3 * 8192
+  let b64 = "";
+  for (let i = 0; i < u8.length; i += CH) {
+    b64 += btoa(String.fromCharCode.apply(null, u8.subarray(i, i + CH)));
+  }
   return `data:${mime};base64,${b64}`;
 }
 
 function imgNote(buf) {
   if (!buf || buf.byteLength <= 0) return "图片内容为空";
-  if (buf.byteLength > VISION_MAX_BYTES) return "图片超过 4MB，跳过视觉识别";
+  if (buf.byteLength > VISION_MAX_BYTES) {
+    return `图片超过 ${(VISION_MAX_BYTES / 1024 / 1024).toFixed(0)}MB，跳过视觉识别，按日期+类型命名`;
+  }
   return "";  // 正常：交给视觉模型识别画面
 }
 
