@@ -4,7 +4,8 @@
 // 部署后访问：https://<script名>.<子域>.workers.dev/
 
 const COMPAT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
-const VISION_MODEL = "@cf/llava-hf/llava-1.5-7b-hf"; // 备用：图片视觉识别（未默认启用）
+const VISION_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct"; // 视觉识别（OCR 能力远超 llava）
+const VISION_MAX_BYTES = 2 * 1024 * 1024;                       // 超过 2MB 的图不送视觉（data URL 会膨胀）
 
 // ---------------------------------------------------------------------------
 // 类型 / 关键词 / 日期 / 命名（本地兜底，与桌面版同思路）
@@ -348,40 +349,89 @@ function extractImgMeta(buf, ext) {
   const meta = {};
   if (ext === "jpg" || ext === "jpeg") {
     try { Object.assign(meta, parseJpegExif(buf) || {}); } catch (e) {}
+  } else if (ext === "png" || ext === "webp" || ext === "tiff" || ext === "tif") {
+    // PNG/webp 的拍摄时间较难无库解析，跳过（视觉模型会兜底内容识别）
   }
   return meta;
+}
+
+function bufToDataUrl(buf, mime) {
+  const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+  return `data:${mime};base64,${b64}`;
+}
+
+function imgNote(buf) {
+  if (!buf || buf.byteLength <= 0) return "图片内容为空";
+  if (buf.byteLength > VISION_MAX_BYTES) return "图片超过 4MB，跳过视觉识别";
+  return "";  // 正常：交给视觉模型识别画面
 }
 
 // ---------------------------------------------------------------------------
 // AI 总结（Workers AI，REST 方式；失败自动本地兜底）
 // ---------------------------------------------------------------------------
 
-async function aiSummarize(env, info) {
+async function runAI(env, model, payload) {
+  const url = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai/run/${model}`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Authorization": "Bearer " + env.CF_API_TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!resp.ok) throw new Error("AI HTTP " + resp.status);
+  const data = await resp.json();
+  const out = data?.result || {};
+  // llama-4 等文本模型返回 choices[0].message.content；llava 返回 description；其它兼容 response
+  const text = String(
+    out.response ??
+    out.description ??
+    out.choices?.[0]?.message?.content ??
+    ""
+  ).trim();
+  if (!text) throw new Error("AI empty");
+  return text;
+}
+
+async function aiSummarize(env, info, buf) {
   if (!env || !env.CF_API_TOKEN) throw new Error("no ai token");
   const isImg = IMG_EXTS.has(info.ext);
-  const sys = "你是文件整理助手。根据用户给出的文件内容/元信息，提炼一个简短贴切的主题，用于重命名文件。规则：只输出文件名主体（不含扩展名、引号、解释），中文 2~18 个字；内容有明确日期/季度可带上，如「2025年第三季度 销售数据分析」。";
   let user = `文件类型: ${info.kind}\n文件名: ${info.name}`;
   if (info.shotTime) user += `\n拍摄时间: ${info.shotTime}`;
-  user += `\n内容摘录:\n${(info.text || "(正文无法读取)").slice(0, 2500)}`;
-  const body = {
+  if (info.metaText) user += `\n拍摄设备: ${info.metaText}`;
+
+  if (isImg && buf && buf.byteLength <= VISION_MAX_BYTES) {
+    // 视觉识别（Llama 4 Scout）：有文字→按文字出主题；无文字→按画面出主题
+    const mime = (info.ext === "jpg" || info.ext === "jpeg") ? "image/jpeg"
+      : info.ext === "png" ? "image/png"
+      : info.ext === "webp" ? "image/webp" : "image/jpeg";
+    const dataUrl = bufToDataUrl(buf, mime);
+    const sys = "你是文件整理助手，负责给图片文件起一个简短贴切的中文主题名（用于重命名文件）。判断规则：一、如果图片里有文字（标题、正文、数字、日期等），先逐字读出文字，然后【优先依据文字内容】给出主题名（例如「2025年第三季度财务预算审批表」「产品发布会议程」）；二、如果图片里没有任何文字，再依据画面内容给出主题名（例如「公司年会舞台合影」「西湖断桥黄昏」）。要求：只输出主题名本身（不含扩展名、引号、解释、句号），中文 2~20 个字。";
+    const theme = await runAI(env, VISION_MODEL, {
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: [
+          { type: "text", text: (info.shotTime ? `拍摄时间: ${info.shotTime}\n` : "") + "请给这张图片起主题名。" },
+          { type: "image_url", image_url: { url: dataUrl } },
+        ]},
+      ],
+      max_tokens: 120,
+    });
+    return theme.replace(/^["'“”‘’.。\s]+|["'“”‘’\s]+$/g, "").split(/[。.\n]/)[0].trim();
+  }
+
+  // 文本 / Office / 超限图片：直接文本模型
+  const sys = isImg
+    ? "你是文件整理助手。根据用户给出的图片元信息，为图片文件提炼简短中文主题名。规则：只输出文件名主体（不含扩展名、引号、解释），中文 2~20 个字。"
+    : "你是文件整理助手。根据用户给出的文件内容/元信息，提炼一个简短贴切的主题，用于重命名文件。规则：只输出文件名主体（不含扩展名、引号、解释），中文 2~18 个字；内容有明确日期/季度可带上，如「2025年第三季度 销售数据分析」。";
+  if (!isImg) user += `\n内容摘录:\n${(info.text || "(正文无法读取)").slice(0, 2500)}`;
+  const theme = await runAI(env, COMPAT_MODEL, {
     messages: [
       { role: "system", content: sys },
       { role: "user", content: user },
     ],
     max_tokens: 60,
     temperature: 0.3,
-  };
-  const url = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai/run/${COMPAT_MODEL}`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Authorization": "Bearer " + env.CF_API_TOKEN, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
   });
-  if (!resp.ok) throw new Error("AI HTTP " + resp.status);
-  const data = await resp.json();
-  const theme = String(data?.result?.response || "").trim().replace(/^["'“”‘’.。\s]+|["'“”‘’\s]+$/g, "").split("\n")[0];
-  if (!theme) throw new Error("AI empty");
-  return theme;
+  return theme.replace(/^["'“”‘’.。\s]+|["'“”‘’\s]+$/g, "").split("\n")[0].trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -444,7 +494,9 @@ async function analyzeOne(env, file) {
       const meta = extractImgMeta(buf, ext);
       if (meta.shotTime) info.shotTime = String(meta.shotTime).replace(/:/g, "-");
       if (meta.make || meta.model) info.metaText = `${meta.make || ""} ${meta.model || ""}`.trim();
+      info.imgBuf = buf;   // 供视觉模型识别画面内容
       info.text = "";
+      info.note = imgNote(info.imgBuf);
     } else if (ext === "pdf") {
       info.note = "PDF 云端暂不解析正文，按日期+类型命名";
     }
@@ -456,7 +508,7 @@ async function analyzeOne(env, file) {
   let usedAI = false;
   if (env && env.CF_API_TOKEN) {
     try {
-      const theme = await aiSummarize(env, info);
+      const theme = await aiSummarize(env, info, info.imgBuf || null);
       info.theme = sanitize(theme, 40);
       usedAI = true;
     } catch (e) {
