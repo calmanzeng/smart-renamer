@@ -50,7 +50,34 @@
 | `.doc` / `.xls` / `.ppt`（旧版 Office） | 暂不解析正文，按日期+原名整理 |
 | 其他（视频、压缩包等） | 按日期 + 原名整理 |
 
-## 五、文件说明
+## 五、☁️ 云端版（Cloudflare Workers + AI）
+
+除了本地版，项目还带一个**部署在 Cloudflare Workers 上的网页版**，任何设备打开网址即可用：
+
+- **地址**：https://smart-renamer.calman198705.workers.dev
+- **流程**：浏览器拖入文件 → 云端抽取内容并用 Cloudflare 自带 LLM（llama-3.3-70b）总结主题 → 给出建议名 → 本地下载改名后的文件（正文不落云端）
+
+```
+cloudflare/
+├── worker.js         零依赖 Worker（手写 ZIP/EXIF 解析 + 类型/关键词/日期 + Workers AI 总结）
+├── wrangler.toml     wrangler 配置（名称、兼容日期、CF_ACCOUNT_ID）
+├── test_worker.mjs   本地 Node 测试（模拟 FormData 上传样本）
+└── verify_online2.mjs 线上端到端验证（真实 Chrome 上传 → AI 分析 → 建议名 → 下载按钮）
+```
+
+**部署/更新**（需要本机有代理时先 `git config --global http.proxy` 或设 HTTPS_PROXY）：
+
+```bash
+cd cloudflare
+npx wrangler deploy                            # 上传代码
+echo <API_TOKEN> | npx wrangler secret put CF_API_TOKEN   # 配置 AI 调用凭证
+```
+
+> 说明：workers.dev 账户子域分配后**不能通过 API 修改**（Cloudflare 限制）；若想要
+> `smart-renamer.workers.dev` 这样的纯净域名，需在 Cloudflare 绑定自有的自定义域名，
+> 或联系 Cloudflare 支持调整子域。
+
+## 六、文件说明
 
 ```
 smart-renamer/
@@ -62,7 +89,8 @@ smart-renamer/
 ├── make_samples.py     生成 7 种示例文件到 samples/
 ├── test_core.py        本地模式功能测试
 ├── test_ai.py          AI 模式测试（本地模拟接口，不消耗额度）
-└── browser_e2e.mjs     无头 Chrome 端到端测试（真实点击走完 添加→改名→撤销→设置；需要本机装有 Chrome）
+├── browser_e2e.mjs     无头 Chrome 端到端测试（真实点击走完 添加→改名→撤销→设置；需要本机装有 Chrome）
+└── cloudflare/         云端版（见上节）
 ```
 
 ## 六、常见问题

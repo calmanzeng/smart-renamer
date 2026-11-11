@@ -1,0 +1,6 @@
+name = "smart-renamer"
+main = "worker.js"
+compatibility_date = "2025-05-01"
+
+[vars]
+CF_ACCOUNT_ID = "cfedcec6ff705cd4535211c202392996"
