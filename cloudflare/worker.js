@@ -754,6 +754,7 @@ async function analyzeOne(env, file) {
   }
   const local = proposeName(info);
   const date = findDate(info.text, info.name, info);
+  info.date = date;
   const stem = usedAI ? info.theme : local;
   const finalStem = usedAI ? stem : (date ? `${date} ${stem}` : stem);
   // 保证扩展名唯一性
@@ -853,6 +854,14 @@ const HTML = String.raw`<!DOCTYPE html>
   .toast.err{border-color:rgba(255,107,107,.5);color:#ffc9c9}
   @keyframes pop{from{opacity:0;transform:translateY(-8px)}}
   .ghost{text-align:center;color:var(--txt3);padding:26px;font-size:12.5px;line-height:2}
+  .tplbar{display:flex;align-items:center;gap:8px;margin-top:14px;flex-wrap:wrap;
+    background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 14px}
+  .tplabel{color:var(--txt2);font-size:12.5px;font-weight:600;flex:none}
+  .tplin{flex:1;min-width:180px;max-width:340px;background:rgba(255,255,255,.06);border:1px solid var(--line);
+    border-radius:8px;color:var(--txt);padding:8px 10px;font-size:12.5px;outline:none;transition:.15s;font-family:inherit}
+  .tplin:focus{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+  .tplin::placeholder{color:var(--txt3)}
+  .thint{color:var(--txt3);font-size:11px;line-height:1.7}
   @media (max-width:760px){.fcard{flex-wrap:wrap}.fcard .dl{margin-left:0}}
 </style>
 </head>
@@ -879,6 +888,12 @@ const HTML = String.raw`<!DOCTYPE html>
     <button class="iconbtn" id="btnClear">清空</button>
     <div class="grow"></div>
     <span class="note">可直接改新名，然后逐个下载</span>
+  </div>
+
+  <div class="tplbar" id="tplbar" style="display:none">
+    <span class="tplabel">命名模板</span>
+    <input id="sTpl" class="tplin" placeholder="如 {date}_{theme} 或 {type}/{old}" title="自定义命名模板">
+    <span class="thint">{date}日期 · {theme}主题 · {old}原名 · {type}类型 · {n}序号 —— 留空 = 默认方案；也可以直接打字，如 会议记录_{date}</span>
   </div>
 
   <div class="list" id="list"></div>
@@ -910,6 +925,36 @@ const ICONS = { txt:"📄", md:"📝", log:"🗒", csv:"📊", xlsx:"📊", xls:
   docx:"📄", doc:"📄", pdf:"📕", jpg:"🖼", jpeg:"🖼", png:"🖼", gif:"🖼", webp:"🖼", mp4:"🎞", zip:"🗜", exe:"⚙️" };
 const icon = ext => ICONS[ext] || "📎";
 
+/* ===== 命名模板（自定义命名）===== */
+const TPL_KEY = "sr_tpl";
+function getTpl() { try { return (localStorage.getItem(TPL_KEY) || "").trim(); } catch (e) { return ""; } }
+function setTpl(v) { try { localStorage.setItem(TPL_KEY, v); } catch (e) {} }
+function cleanName(v, max = 60) {
+  let s = String(v || "").replace(/[\\/:*?"<>|\x00-\x1f]/g, "_").replace(/\s+/g, " ").trim();
+  if (s.length > max) s = s.slice(0, max).replace(/[ _.-]+$/, "");
+  return s;
+}
+// 模板渲染：{date} {theme} {old} {type} {n}；返回带扩展名的完整文件名，模板为空返回 null
+function renderTemplate(f, idx) {
+  const tpl = getTpl();
+  if (!tpl) return null;
+  const oldStem = (f.file.name || "").replace(/\.[^.]+$/, "");
+  const n = String(idx + 1).padStart(2, "0");
+  let name = tpl
+    .replace(/\{date\}/g, f.date || "")
+    .replace(/\{theme\}/g, f.summary || "")
+    .replace(/\{old\}/g, oldStem)
+    .replace(/\{type\}/g, f.kind || "")
+    .replace(/\{n\}/g, n);
+  // 空占位符清理：去掉因占位符为空而残留的分隔与首尾符号
+  name = name.replace(/[_\-.\s]{2,}/g, (m) => (m.includes(" ") ? " " : m[0]))
+             .replace(/^[_\-.\s]+/, "").replace(/[_\-.\s]+$/, "");
+  const ext = (f.file.name.split(".").pop() || "file").toLowerCase();
+  const cleaned = cleanName(name);
+  if (!cleaned) return null;
+  return cleaned + "." + ext;
+}
+
 async function analyze(list) {
   if (!list.length) return;
   busy(true, "上传并分析 " + list.length + " 个文件…");
@@ -922,11 +967,17 @@ async function analyze(list) {
     data.results.forEach((res, i) => {
       const item = list[i];
       item.suggested = res.suggested || item.file.name;
+      item.defaultSuggested = res.suggested || item.file.name;
+      item.date = res.date || "";
       item.summary = res.local || res.theme || "";
       item.kind = res.kind;
       item.usedAI = !!res.usedAI;
       item.note = res.note || res.aiNote || "";
       item.status = "ready";
+    });
+    // 套用自定义命名模板
+    files.forEach((f, idx) => {
+      if (!f.custom && renderTemplate(f, idx)) f.suggested = renderTemplate(f, idx);
     });
     render();
     const okN = data.results.filter(x => x.suggested).length;
@@ -954,7 +1005,11 @@ function addFiles(fileList) {
 function render() {
   const list = $("list");
   list.innerHTML = "";
-  files.forEach(f => {
+  files.forEach((f, idx) => {
+    if (!f.custom && f.status === "ready") {
+      const tplName = renderTemplate(f, idx);
+      if (tplName) f.suggested = tplName;
+    }
     const ext = (f.file.name.split(".").pop() || "").toLowerCase();
     const card = document.createElement("div");
     card.className = "fcard";
@@ -964,8 +1019,9 @@ function render() {
     const old = document.createElement("span"); old.className = "old"; old.textContent = f.file.name; old.title = f.file.name;
     const arr = document.createElement("span"); arr.className = "arrow"; arr.textContent = "→";
     const inp = document.createElement("input"); inp.className = "newname"; inp.value = f.suggested || f.file.name;
-    const strName = () => { let v = inp.value.trim().replace(/[\\\/:*?"<>|\x00-\x1f]/g, "_"); inp.value = v; f.suggested = v; };
+    const strName = () => { let v = inp.value.trim().replace(/[\\\/:*?"<>|\x00-\x1f]/g, "_"); inp.value = v; f.suggested = v; f.custom = true; };
     inp.addEventListener("change", strName);
+    inp.addEventListener("input", strName);
     names.append(old, arr, inp);
     const kind = document.createElement("div"); kind.className = "kind";
     kind.innerHTML = "<b>" + esc(f.kind || "未知") + "</b>" + (f.summary ? " · " + esc(f.summary) : "") +
@@ -986,6 +1042,7 @@ function render() {
   });
   $("ghost").style.display = files.length ? "none" : "block";
   $("toolbar").style.display = files.length ? "flex" : "none";
+  $("tplbar").style.display = files.length ? "flex" : "none";
 }
 
 function downloadOne(f) {
@@ -1006,6 +1063,20 @@ $("drop").ondrop = (e) => { e.preventDefault(); $("drop").classList.remove("drag
 $("fileInput").onchange = (e) => { addFiles(e.target.files); e.target.value = ""; };
 $("btnRe").onclick = () => analyze(files.filter(f => f.status !== "queued"));
 $("btnClear").onclick = () => { if (files.length && confirm("清空全部？")) { files.length = 0; render(); } };
+
+// 命名模板：实时生效（保留用户手动改过的行）
+$("sTpl").value = getTpl();
+$("sTpl").addEventListener("change", () => {
+  setTpl($("sTpl").value);
+  files.forEach((f, idx) => {
+    if (!f.custom && f.status === "ready") {
+      const tplName = renderTemplate(f, idx);
+      if (tplName) f.suggested = tplName;
+    }
+  });
+  render();
+  toast("命名模板已更新" + (files.length ? "，已应用到未手动修改的文件" : ""), "ok");
+});
 render();
 </script>
 </body>

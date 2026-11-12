@@ -57,13 +57,18 @@
 - **主地址**：https://smart-renamer.life-dao.com
 - **备用地址**：https://smart-renamer.calman198705.workers.dev
 - **流程**：浏览器拖入文件 → 云端抽取内容并用 Cloudflare 自带 LLM（llama-3.3-70b）总结主题 → 给出建议名 → 本地下载改名后的文件（正文不落云端）
+- **自定义命名模板**：分析区上方有「命名模板」输入框，支持占位符
+  `{date}` 日期 · `{theme}` 主题 · `{old}` 原名 · `{type}` 类型 · `{n}` 序号（两位数），
+  例如 `{date}_{theme}`、`{old}-{n}`、`会议记录_{date}`；即时生效、自动存浏览器本地，
+  单个文件仍可手动改新名（手动改过的行不被模板覆盖），模板留空即默认方案。
 
 ```
 cloudflare/
 ├── worker.js         零依赖 Worker（手写 ZIP/EXIF 解析 + 类型/关键词/日期 + Workers AI 总结）
 ├── wrangler.toml     wrangler 配置（名称、兼容日期、CF_ACCOUNT_ID、域名说明）
 ├── test_worker.mjs   本地 Node 测试（模拟 FormData 上传样本）
-└── verify_online2.mjs 线上端到端验证（真实 Chrome 上传 → AI 分析 → 建议名 → 下载按钮）
+├── verify_online2.mjs 线上端到端验证（真实 Chrome 上传 → AI 分析 → 建议名 → 下载按钮）
+└── verify_template.mjs 线上端到端验证（自定义命名模板：设模板→上传→按模板命名→手动行不被覆盖）
 ```
 
 **自定义域名绑定方式**（Cloudflare Custom Domains API 仅支持 OAuth，API Token 会报 10405，故用旧式 Route）：
